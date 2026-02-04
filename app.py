@@ -24,7 +24,6 @@ def check_password():
             submitted = st.form_submit_button("登入")
             
             if submitted:
-                # 請確認 secrets.toml 裡有設定 main_password
                 if password == st.secrets["passwords"]["main_password"]:
                     st.session_state.password_correct = True
                     st.rerun()
@@ -36,29 +35,68 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- 3. 側邊欄：選擇分店 ---
+# --- 3. 側邊欄：選擇分店與人員 ---
 with st.sidebar:
     st.header("🏢 請選擇分店")
     
+    # 分店清單
     branch_options = [
         "ALL", "東門店", "小西門店", "文賢店", 
         "歸仁店", "永康店", "安中店", "鹽行店", "五甲店"
     ]
-    
     selected_branch = st.selectbox("切換戰情看板", branch_options)
-    st.info(f"正在讀取：{selected_branch} 分頁...")
+
+    # 讀取網址
+    try:
+        target_url = st.secrets["branch_urls"][selected_branch]
+    except KeyError:
+        st.error(f"❌ 尚未設定「{selected_branch}」的試算表網址！")
+        st.stop()
+
+    # --- 人員選擇邏輯 (v2.3 下拉選單穩定版) ---
+    target_person = "全店總表" # 預設值
+    
+    if selected_branch != "ALL":
+        st.markdown("---")
+        st.header("👤 選擇檢視對象")
+        
+        # 1. 從 secrets 讀取該店的人員名單
+        staff_list = []
+        if "branch_staff" in st.secrets:
+             staff_list = st.secrets["branch_staff"].get(selected_branch, [])
+        
+        # 2. 判斷顯示模式
+        if staff_list:
+            # 如果有設定名單 -> 顯示下拉選單
+            options = ["全店總表"] + staff_list
+            target_person = st.selectbox("請選擇人員", options)
+        else:
+            # 如果沒設定名單 -> 顯示文字輸入框 (備用方案)
+            person_mode = st.radio("顯示模式", ["全店總表", "指定人員 (手動輸入)"])
+            
+            if person_mode == "指定人員 (手動輸入)":
+                target_person = st.text_input("請輸入人員分頁名稱", placeholder="例如: 914")
+                if not target_person:
+                    st.warning("請輸入名稱")
+                    st.stop()
+            else:
+                target_person = selected_branch # 全店總表
+
+    else:
+        # ALL 模式
+        target_person = "ALL"
+
+    st.info(f"正在讀取：{selected_branch} > {target_person}")
     
     if st.button("🔄 強制重新讀取資料"):
         st.cache_data.clear()
         st.rerun()
 
-# --- 4. 讀取資料 (v2.1 自動化升級) ---
+# --- 4. 讀取資料 ---
 @st.cache_data(ttl=600)
-def load_data(worksheet_name):
+def load_data(url, worksheet):
     conn = st.connection("gsheets", type=GSheetsConnection)
-    
-    # 讀取整張表
-    df_raw = conn.read(worksheet=worksheet_name, header=None)
+    df_raw = conn.read(spreadsheet=url, worksheet=worksheet, header=None)
     
     # A. 抓取 年份(A2) 和 月份(B2)
     try:
@@ -100,9 +138,7 @@ def load_data(worksheet_name):
         
         df = df.drop(columns=['year_temp', 'month_temp', 'day_temp'])
     
-    # F. 全自動數字轉換 (v2.1 關鍵修改)
-    # 以前是指定 numeric_cols，現在我們遍歷「所有」欄位
-    # 只要不是 '日期'，就試著把它轉成數字。這樣未來您新增欄位，這裡會自動抓到。
+    # F. 全自動數字轉換
     for col in df.columns:
         if col != '日期':
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
@@ -110,28 +146,39 @@ def load_data(worksheet_name):
     return df
 
 try:
-    df_view = load_data(selected_branch)
+    # 決定要讀取的分頁名稱
+    worksheet_to_load = target_person
+    
+    # 特例處理：如果選的是「全店總表」，實際上要去讀的分頁名稱就是「分店名」(例如：東門店)
+    # 除非是 ALL 模式，分頁才叫 ALL
+    if target_person == "全店總表":
+        worksheet_to_load = selected_branch 
+    if target_person == "ALL":
+        worksheet_to_load = "ALL" # 假設全店總表的分頁名叫 ALL，請依實際修改
+
+    df_view = load_data(target_url, worksheet_to_load)
+    
 except Exception as e:
-    st.error(f"❌ 讀取失敗！請確認試算表狀態。")
-    st.error(f"錯誤訊息: {e}")
+    st.error(f"❌ 讀取失敗！")
+    st.markdown(f"**可能原因：**\n1. 網址錯誤\n2. 找不到分頁名稱「{worksheet_to_load}」\n3. secrets.toml 名單設定有誤")
+    st.error(f"系統訊息: {e}")
     st.stop()
 
 # --- 5. 顯示戰情儀表板 ---
 
-st.title(f"📊 {selected_branch} - 營運戰情室")
-st.caption(f"v2.1 | 資料來源: A2年份/B2月份 + A15日期 | 更新時間: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}")
+display_title = f"{selected_branch} - {target_person}"
+st.title(f"📊 {display_title} 戰情室")
+st.caption(f"v2.3 穩定版 | 資料來源: {selected_branch} > {worksheet_to_load}")
 
 if df_view.empty:
-    st.warning("⚠️ 讀取後無資料，請檢查 A2/B2 是否有年份月份，以及 A15 開始是否有填寫日期。")
+    st.warning("⚠️ 讀取後無資料，請檢查檔案內容。")
     st.stop()
 
 # =========================================================
 #  [第一層] 營運戰情看板
 # =========================================================
 
-# 計算總和函數
 def get_sum(col_name):
-    # 使用 .get() 確保即使欄位不存在也不會報錯 (會回傳 0)
     return df_view.get(col_name, pd.Series([0])).sum()
 
 # --- A. 💰 財務金額區 ---
@@ -157,19 +204,13 @@ with col_i2: st.metric("VIVO 手機", f"{get_sum('VIVO手機'):,.0f}")
 with col_i3: st.metric("蘋果手機", f"{get_sum('蘋果手機'):,.0f}")
 with col_i4: st.metric("蘋果平板+手錶", f"{get_sum('蘋果平板+手錶'):,.0f}")
 
-# --- D. 🔵 遠傳指標 (v2.1 新增) ---
+# --- D. 🔵 遠傳指標 ---
 st.markdown("### 🔵 遠傳指標")
 col_f1, col_f2, col_f3, col_f4 = st.columns(4)
-
-with col_f1:
-    st.metric("續約累積 GAP", f"{get_sum('遠傳續約累積GAP'):,.0f}")
-with col_f2:
-    # 假設是百分比，這裡先顯示原數字，若是 0.8 這種格式可自行 x100
-    st.metric("升續率", f"{get_sum('遠傳升續率'):.1f}") 
-with col_f3:
-    st.metric("平續率", f"{get_sum('遠傳平續率'):.1f}")
-with col_f4:
-    st.metric("綜合指標", f"{get_sum('綜合指標'):.1f}")
+with col_f1: st.metric("續約累積 GAP", f"{get_sum('遠傳續約累積GAP'):,.0f}")
+with col_f2: st.metric("升續率", f"{get_sum('遠傳升續率'):.1f}") 
+with col_f3: st.metric("平續率", f"{get_sum('遠傳平續率'):.1f}")
+with col_f4: st.metric("綜合指標", f"{get_sum('綜合指標'):.1f}")
 
 st.markdown("---")
 
@@ -206,48 +247,51 @@ with c2:
     else:
         st.info("無數據可顯示")
 
-# [第三層] 詳細資料表 (v1.9 終極重建法 - 支援自動欄位更新)
-with st.expander(f"查看 {selected_branch} 詳細資料 (自動同步新增欄位)"):
+# [第三層] 詳細資料表 (v2.5 顯示優化版)
+with st.expander(f"查看 {display_title} 詳細資料 (自動同步新增欄位)"):
     df_display = df_view.copy()
     
-    # 格式化日期
+    # 1. 格式化日期 (確保顯示為 YYYY-MM-DD)
     if '日期' in df_display.columns:
         df_display['日期'] = df_display['日期'].dt.strftime('%Y-%m-%d')
     
-    # 1. 解構 (Deconstruct)
-    data_as_dicts = df_display.to_dict(orient='records')
+    # 2. 欄位大風吹：把「日期」搬到第一欄，並移除原本的「日(業績項目)」
+    # 邏輯：找出第一欄的名稱 (通常是 '業績項目' 或 '日期')
+    first_col_name = df_display.columns[0]
     
-    # 2. 重建 (Rebuild)
+    # 如果系統生成的完整 '日期' 存在
+    if '日期' in df_display.columns:
+        # 建立新的欄位順序：日期排第一，接著是其他欄位 (扣除掉原本的第1欄 '業績項目' 避免重複)
+        # 注意：我們把 first_col_name (即 '業績項目') 排除掉，因為它只顯示 1, 2，資訊太少
+        cols = ['日期'] + [c for c in df_display.columns if c != '日期' and c != first_col_name]
+        df_display = df_display[cols]
+    
+    # 3. 解構與重建 (維持穩定性)
+    data_as_dicts = df_display.to_dict(orient='records')
     df_clean = pd.DataFrame(data_as_dicts)
     
-    # 3. 欄位顯示設定
+    # 4. 欄位顯示設定
     column_config_settings = {}
+    
+    # 設定日期欄位的標題名稱
+    column_config_settings["日期"] = st.column_config.TextColumn(
+        "📅 日期",  # 這裡可以改標題顯示名稱
+        help="交易日期"
+    )
+
     for col in df_clean.columns:
         if pd.api.types.is_numeric_dtype(df_clean[col]):
-             # 讓所有數字看起來像整數 (如果您希望比率顯示小數點，這裡可以微調)
-             # 目前設定：有小數點的會四捨五入顯示 (例如 0.8 會變 1)，若需精準可改 %.1f
              column_config_settings[col] = st.column_config.NumberColumn(format="%.0f")
 
-    # 4. 顯示
+    # 5. 顯示表格 (關鍵：hide_index=True)
     st.dataframe(
         df_clean,
         column_config=column_config_settings,
-        use_container_width=True
+        use_container_width=True,
+        hide_index=True  # 👈 這一行就是讓 (指數) 0, 1, 2 消失的魔法！
     )
 
-# --- 6. 頁尾版權與版本資訊 ---
+# --- 6. 頁尾版權 ---
 st.markdown("---")
 with st.container():
-    col_footer_L, col_footer_R = st.columns([3, 1])
-    
-    with col_footer_L:
-        st.caption("© 2026 馬尼通訊管理部 | Mani Communication Management System")
-        
-    with col_footer_R:
-        with st.expander("ℹ️ 版本資訊"):
-            st.markdown("""
-            **目前版本：v2.1 (Auto-Detect)**
-            - 新增：遠傳指標專區 (累積GAP、升續率、平續率、綜合指標)。
-            - 優化：全自動欄位偵測 (未來新增欄位會自動顯示在詳細資料表中)。
-            - 核心：維持 v1.9 的重建法核心，確保系統穩定。
-            """)
+    st.caption("© 2026 馬尼通訊管理部 | v2.3 Stable Config Mode")
