@@ -3,7 +3,7 @@ from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 import plotly.express as px
 import numpy as np
-import json # 引入 json 用於除錯
+import json 
 
 # --- 1. 頁面基礎設定 ---
 st.set_page_config(page_title="馬尼通訊戰情室", page_icon="📱", layout="wide", initial_sidebar_state="expanded")
@@ -18,9 +18,8 @@ def check_password():
             password = st.text_input("Password", type="password")
             submitted = st.form_submit_button("登入")
             if submitted:
-                # 檢查 secrets 是否存在
                 if "passwords" not in st.secrets:
-                    st.error("❌ 找不到 secrets.toml 設定檔！如果您在本機執行，請確認 .streamlit 資料夾內有此檔案。")
+                    st.error("❌ 找不到 secrets.toml 設定檔！")
                     return False
                 
                 if password == st.secrets["passwords"]["main_password"]:
@@ -34,17 +33,10 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- 🛠️ (v3.0 核心修復) 數據清洗工具 ---
-# 這個函式專門用來解決 Windows 下 "int64 is not JSON serializable" 的崩潰問題
+# --- 🛠️ 數據清洗工具 ---
 def clean_df_for_streamlit(df):
-    if df.empty:
-        return df
-    
-    # 1. 重設索引，避免 Index 是 int64
+    if df.empty: return df
     df = df.reset_index(drop=True)
-    
-    # 2. 核彈級清洗：轉成 Python 原生字典再轉回來
-    # 這會強迫所有 Numpy 特殊格式 (int64) 變成標準 Python int/float
     try:
         data_dict = df.to_dict(orient='records')
         df_clean = pd.DataFrame(data_dict)
@@ -52,25 +44,54 @@ def clean_df_for_streamlit(df):
     except:
         return df
 
-# --- 3. 側邊欄與資料讀取 ---
+# --- 3. (v3.2 更新) 提早讀取並過濾英雄榜資料 ---
+@st.cache_data(ttl=600)
+def load_leaderboard_data():
+    if "leaderboard" not in st.secrets:
+        return pd.DataFrame()
+    try:
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        df = conn.read(spreadsheet=st.secrets["leaderboard"]["url"])
+        
+        # 🛡️ [v3.2 關鍵修正] 過濾掉被誤判為人員的「門市總表」
+        if not df.empty and '人員' in df.columns and '分店' in df.columns:
+            # 邏輯：如果「人員名稱」等於「分店名稱」扣掉"店"字 (例如: 小西門店 vs 小西門)
+            # 就要把它刪掉，因為它是總表
+            
+            # 1. 建立一個過濾遮罩
+            # df['分店'].str.replace('店', '') 會把 "小西門店" 變成 "小西門"
+            mask = df['人員'] != df['分店'].str.replace('店', '')
+            
+            # 2. 額外過濾：如果有任何人員名稱完全包含"店"字且跟分店名一樣，也過濾
+            mask2 = df['人員'] != df['分店']
+            
+            # 應用過濾
+            df = df[mask & mask2]
+            
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+# 載入並自動過濾資料
+df_lb = load_leaderboard_data()
+
+# --- 4. 側邊欄與主要資料讀取 ---
 with st.sidebar:
     st.header("🏢 請選擇分店")
     branch_options = ["ALL", "東門店", "小西門店", "文賢店", "歸仁店", "永康店", "安中店", "鹽行店", "五甲店"]
     selected_branch = st.selectbox("切換戰情看板", branch_options)
 
-    # 讀取主要資料
     try:
         if "branch_urls" not in st.secrets:
-            st.error("❌ 找不到 [branch_urls] 設定，請檢查 secrets.toml")
+            st.error("❌ 找不到 [branch_urls] 設定")
             st.stop()
         target_url = st.secrets["branch_urls"][selected_branch]
     except KeyError:
-        st.error(f"❌ 尚未設定「{selected_branch}」的試算表網址！")
+        st.error(f"❌ 尚未設定「{selected_branch}」")
         st.stop()
 
-    # 人員選擇邏輯
     target_person = "全店總表"
-    worksheet_to_load = selected_branch # 預設
+    worksheet_to_load = selected_branch 
 
     if selected_branch != "ALL":
         st.markdown("---")
@@ -86,12 +107,6 @@ with st.sidebar:
                 worksheet_to_load = selected_branch
             else:
                 worksheet_to_load = target_person
-        else:
-            worksheet_to_load = selected_branch
-
-    else:
-        target_person = "ALL"
-        worksheet_to_load = "ALL"
 
     st.info(f"檢視模式：{selected_branch} > {target_person}")
     
@@ -99,21 +114,19 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-# --- 資料讀取函式 ---
+# --- 讀取單店/單人詳細資料 ---
 @st.cache_data(ttl=600)
 def load_data(url, worksheet):
     conn = st.connection("gsheets", type=GSheetsConnection)
     df_raw = conn.read(spreadsheet=url, worksheet=worksheet, header=None)
     
-    # 處理年份月份
     try:
         year_val = pd.to_numeric(df_raw.iloc[1, 0], errors='coerce')
         month_val = pd.to_numeric(df_raw.iloc[1, 1], errors='coerce')
         year_val = int(year_val) if not pd.isna(year_val) else 2026
         month_val = int(month_val) if not pd.isna(month_val) else 1
     except:
-        year_val = 2026
-        month_val = 1
+        year_val = 2026; month_val = 1
 
     headers = df_raw.iloc[2].astype(str).str.strip()
     df = df_raw.iloc[14:].copy()
@@ -126,15 +139,12 @@ def load_data(url, worksheet):
     if not df.empty:
         first_col = df.columns[0]
         df = df[pd.to_numeric(df[first_col], errors='coerce').notna()]
-        
-        # 建立日期
         df['year'] = year_val
         df['month'] = month_val
         df['day'] = df[first_col].astype(int)
         df['日期'] = pd.to_datetime(df[['year', 'month', 'day']], errors='coerce')
         df = df.drop(columns=['year', 'month', 'day'])
 
-    # 數值轉換：全部轉為 float
     for col in df.columns:
         if col != '日期':
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(float)
@@ -145,10 +155,9 @@ try:
     df_view = load_data(target_url, worksheet_to_load)
 except Exception as e:
     st.error("❌ 資料讀取失敗")
-    st.markdown(f"**詳細錯誤訊息：** `{e}`")
     st.stop()
 
-# --- 4. 主要儀表板顯示 ---
+# --- 5. 儀表板顯示 ---
 display_title = f"{selected_branch} - {target_person}"
 st.title(f"📊 {display_title} 戰情室")
 
@@ -156,11 +165,8 @@ if df_view.empty:
     st.warning("⚠️ 無資料")
     st.stop()
 
-# =========================================================
-#  [第一層] 營運戰情看板
-# =========================================================
-def get_sum(col_name):
-    return df_view.get(col_name, pd.Series([0])).sum()
+# [第一層] 營運戰情看板
+def get_sum(col_name): return df_view.get(col_name, pd.Series([0])).sum()
 
 st.markdown("### 💰 營收與獲利")
 m1, m2, m3 = st.columns(3)
@@ -197,109 +203,133 @@ c1, c2 = st.columns([2, 1])
 with c1:
     st.subheader("📈 日毛利趨勢")
     if '日期' in df_view.columns and '毛利' in df_view.columns:
-        # 使用 clean_df 確保圖表數據也是乾淨的
         daily_data = df_view.groupby('日期')['毛利'].sum().reset_index()
         daily_data = daily_data.sort_values('日期')
         daily_data = clean_df_for_streamlit(daily_data)
-        
         fig_line = px.line(daily_data, x='日期', y='毛利', markers=True)
         fig_line.update_xaxes(tickformat="%m/%d") 
         fig_line.update_layout(height=350)
         st.plotly_chart(fig_line, use_container_width=True)
     else:
-        st.warning("無法畫圖：缺少必要欄位")
+        st.warning("無法畫圖")
 
 with c2:
-    st.subheader("📊 營收結構")
-    metrics = {'毛利': get_sum('毛利'), '配件營收': get_sum('配件營收'), '保險營收': get_sum('保險營收')}
-    metrics = {k: v for k, v in metrics.items() if v > 0}
-    if metrics:
-        df_pie = pd.DataFrame(list(metrics.items()), columns=['類別', '金額'])
-        df_pie = clean_df_for_streamlit(df_pie) # 清洗
-        fig_pie = px.pie(df_pie, values='金額', names='類別', hole=0.4)
-        fig_pie.update_layout(height=350, showlegend=True)
-        st.plotly_chart(fig_pie, use_container_width=True)
+    st.subheader("📊 各店毛利佔比")
+    
+    if df_lb.empty:
+        st.info("⚠️ 無法讀取全公司資料，請確認 GAS 腳本。")
     else:
-        st.info("無數據")
+        # [v3.2] 這裡使用的 df_lb 已經在上方過濾過，所以數字會是正確的
+        if '毛利' in df_lb.columns and '分店' in df_lb.columns:
+            df_lb['毛利'] = pd.to_numeric(df_lb['毛利'], errors='coerce').fillna(0)
+            
+            df_branch_pie = df_lb.groupby('分店')['毛利'].sum().reset_index()
+            df_branch_pie = clean_df_for_streamlit(df_branch_pie)
+            
+            fig_pie = px.pie(
+                df_branch_pie, 
+                values='毛利', 
+                names='分店', 
+                hole=0.4,
+                title="全公司總營收結構"
+            )
+            fig_pie.update_layout(height=350, showlegend=True, margin=dict(t=30, b=0, l=0, r=0))
+            fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+            st.plotly_chart(fig_pie, use_container_width=True)
+        else:
+            st.warning("欄位缺失，無法繪製佔比圖")
 
 st.markdown("---")
 
 # =========================================================
-#  🏆 全公司業績英雄榜 (v3.0 本機除錯版)
+#  🏆 全公司業績英雄榜
 # =========================================================
 st.subheader("🏆 全公司業績英雄榜")
 with st.expander("展開查看全公司跨店排名 (由 GAS 自動彙整)", expanded=True):
     
-    # 檢查是否在本機執行且缺少 secrets
-    if "leaderboard" not in st.secrets:
-        st.error("❌ 讀取失敗：您的 `secrets.toml` 檔案中缺少 `[leaderboard]` 設定。")
-        st.info("💡 因為您是在本機執行，雲端的設定不會自動同步下來。請手動打開電腦裡的 `.streamlit/secrets.toml`，把 [leaderboard] 那一段貼進去。")
+    if df_lb.empty:
+        if "leaderboard" not in st.secrets:
+             st.error("❌ 讀取失敗：您的 secrets.toml 缺少 `[leaderboard]` 設定。")
+        else:
+             st.warning("⚠️ 連線成功但無資料。請確認 GAS 腳本已執行。")
     else:
-        try:
-            leaderboard_url = st.secrets["leaderboard"]["url"]
-            conn_lb = st.connection("gsheets", type=GSheetsConnection)
-            df_lb = conn_lb.read(spreadsheet=leaderboard_url)
+        tab1, tab2 = st.tabs(["👤 個人排名", "🏢 門市排名"])
+        
+        rank_options = [
+            "毛利", "門號", "保險營收", "配件營收", 
+            "庫存手機", "蘋果手機", "蘋果平板+手錶", "VIVO手機",
+            "生活圈", "GOOGLE 評論", "來客數", 
+            "遠傳續約累積GAP", "遠傳升續率", "遠傳平續率"
+        ]
+        
+        # --- 分頁 1: 個人排名 ---
+        with tab1:
+            lb_col1, lb_col2 = st.columns([1, 3])
+            with lb_col1:
+                rank_metric_p = st.radio("指標 (個人)", rank_options, index=0, key="rank_p")
             
-            if df_lb.empty:
-                st.warning("⚠️ 連線成功但無資料。請確認 GAS 腳本已執行。")
-            else:
-                lb_col1, lb_col2 = st.columns([1, 3])
-                with lb_col1:
-                    rank_options = [
-                        "毛利", "門號", "保險營收", "配件營收", 
-                        "庫存手機", "蘋果手機", "蘋果平板+手錶", "VIVO手機",
-                        "生活圈", "GOOGLE 評論", "來客數", 
-                        "遠傳續約累積GAP", "遠傳升續率", "遠傳平續率"
-                    ]
-                    rank_metric = st.radio("選擇排名指標", rank_options, index=0)
-                
-                with lb_col2:
-                    if rank_metric in df_lb.columns:
-                        df_lb[rank_metric] = pd.to_numeric(df_lb[rank_metric], errors='coerce').fillna(0)
-                        df_rank = df_lb.sort_values(by=rank_metric, ascending=False).head(20)
-                        df_rank['Display'] = df_rank.apply(lambda x: f"{x['分店']} - {x['人員']}", axis=1)
-                        
-                        # 清洗數據以防圖表崩潰
-                        df_rank = clean_df_for_streamlit(df_rank)
-                        
-                        fig_rank = px.bar(
-                            df_rank, x=rank_metric, y='Display', orientation='h',
-                            text=rank_metric, title=f"🏆 全公司 {rank_metric} 排行榜 Top 20",
-                            color=rank_metric, color_continuous_scale='Blues'
-                        )
-                        fig_rank.update_layout(yaxis={'categoryorder':'total ascending'}, height=600, xaxis_title=rank_metric, yaxis_title="人員")
-                        fig_rank.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
-                        st.plotly_chart(fig_rank, use_container_width=True)
-                        
-                        if '更新時間' in df_rank.columns:
-                            st.caption(f"ℹ️ 數據最後同步時間：{df_rank['更新時間'].iloc[0]}")
-                    else:
-                        st.warning(f"⚠️ 找不到欄位「{rank_metric}」。")
+            with lb_col2:
+                if rank_metric_p in df_lb.columns:
+                    df_lb[rank_metric_p] = pd.to_numeric(df_lb[rank_metric_p], errors='coerce').fillna(0)
+                    df_rank_p = df_lb.sort_values(by=rank_metric_p, ascending=False).head(20)
+                    
+                    # [v3.2] 這裡顯示的資料已經過濾掉「小西門」總表，所以個人排名不會再出現門市名
+                    df_rank_p['Display'] = df_rank_p.apply(lambda x: f"{x['分店']} - {x['人員']}", axis=1)
+                    
+                    df_rank_p = clean_df_for_streamlit(df_rank_p)
+                    
+                    fig_rank_p = px.bar(
+                        df_rank_p, x=rank_metric_p, y='Display', orientation='h',
+                        text=rank_metric_p, title=f"🏆 個人 Top 20 - {rank_metric_p}",
+                        color=rank_metric_p, color_continuous_scale='Blues'
+                    )
+                    fig_rank_p.update_layout(yaxis={'categoryorder':'total ascending'}, height=500)
+                    fig_rank_p.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
+                    st.plotly_chart(fig_rank_p, use_container_width=True)
+        
+        # --- 分頁 2: 門市排名 ---
+        with tab2:
+            lb_col3, lb_col4 = st.columns([1, 3])
+            with lb_col3:
+                rank_metric_s = st.radio("指標 (門市)", rank_options, index=0, key="rank_s")
+            
+            with lb_col4:
+                if rank_metric_s in df_lb.columns:
+                    # [v3.2] 這裡加總時，因為已經過濾掉重複的總表，所以數字會是正確的 (不會翻倍)
+                    df_lb[rank_metric_s] = pd.to_numeric(df_lb[rank_metric_s], errors='coerce').fillna(0)
+                    df_store = df_lb.groupby('分店')[rank_metric_s].sum().reset_index()
+                    df_store = df_store.sort_values(by=rank_metric_s, ascending=False)
+                    
+                    df_store = clean_df_for_streamlit(df_store)
+                    
+                    fig_rank_s = px.bar(
+                        df_store, x=rank_metric_s, y='分店', orientation='h',
+                        text=rank_metric_s, title=f"🏢 門市總排名 - {rank_metric_s}",
+                        color=rank_metric_s, color_continuous_scale='Reds'
+                    )
+                    fig_rank_s.update_layout(yaxis={'categoryorder':'total ascending'}, height=400)
+                    fig_rank_s.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
+                    st.plotly_chart(fig_rank_s, use_container_width=True)
 
-        except Exception as e:
-            st.error("❌ 讀取失敗。")
-            # 這裡我們把錯誤轉成字串顯示，確保看得到
-            st.warning(f"錯誤類型: {type(e).__name__}")
-            st.warning(f"錯誤內容: {str(e)}")
+        if '更新時間' in df_lb.columns:
+            st.caption(f"ℹ️ 數據最後同步時間：{df_lb['更新時間'].iloc[0]}")
 
 st.markdown("---")
 
-# [第三層] 詳細資料表 (v3.0 核彈級修復版)
+# [第三層] 詳細資料表
 with st.expander(f"查看 {display_title} 詳細資料"):
     df_display = df_view.copy()
+    if '日期' in df_display.columns: df_display['日期'] = df_display['日期'].dt.strftime('%Y-%m-%d')
     
-    # 1. 格式化日期
-    if '日期' in df_display.columns: 
-        df_display['日期'] = df_display['日期'].dt.strftime('%Y-%m-%d')
-    
-    # 2. 調整欄位
     first_col_name = df_display.columns[0]
     if '日期' in df_display.columns:
         cols = ['日期'] + [c for c in df_display.columns if c != '日期' and c != first_col_name]
         df_display = df_display[cols]
     
-    # 3. [關鍵修正] 使用 clean_df_for_streamlit 徹底清洗
-    # 這會把所有 int64 轉成標準 Python 數字，解決 JSON Error
     df_display = clean_df_for_streamlit(df_display)
+    
+    for col in df_display.columns:
+        if pd.api.types.is_numeric_dtype(df_display[col]):
+            df_display[col] = df_display[col].astype(float)
 
     st.dataframe(df_display, use_container_width=True, hide_index=True)
