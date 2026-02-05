@@ -5,7 +5,7 @@ import plotly.express as px
 import numpy as np
 from datetime import datetime
 
-# --- 1. 頁面基礎設定 (v7.0 正式版) ---
+# --- 1. 頁面基礎設定 (v7.1 正式版) ---
 st.set_page_config(page_title="馬尼通訊戰情室", page_icon="📱", layout="wide", initial_sidebar_state="expanded")
 
 # --- 2. 安全登入機制 ---
@@ -51,7 +51,7 @@ def clean_google_sheet_url(url):
     if "/edit" in url: url = url.split("/edit")[0] + "/edit"
     return url
 
-# --- 3. 讀取中央系統配置表 (核心邏輯：填補合併儲存格 + 強力去空白) ---
+# --- 3. 讀取中央系統配置表 (v7.1 核心邏輯：填補 + 斷尾 + 原序) ---
 @st.cache_data(ttl=600)
 def load_system_config():
     if "leaderboard" not in st.secrets:
@@ -76,10 +76,25 @@ def load_system_config():
         df_clean = df_leaderboard_raw.copy()
         
         if not df_clean.empty:
+             # --- [v7.1 新增] 自動切除後台欄位 ---
+             # 邏輯：找到 "--->勿動" 這一欄，把它和後面的所有欄位都丟掉
+             cols_list = list(df_clean.columns)
+             cut_off_index = -1
+             for i, col_name in enumerate(cols_list):
+                 if "--->勿動" in str(col_name):
+                     cut_off_index = i
+                     break
+             
+             if cut_off_index != -1:
+                 # 只保留 "--->勿動" 之前的欄位
+                 df_clean = df_clean.iloc[:, :cut_off_index]
+             
+             # ------------------------------------
+
              # 確保欄位名稱為字串
              cols = [str(c) for c in df_clean.columns]
              
-             # --- 關鍵修復 1: 處理月份 (合併儲存格填補 + 格式統一) ---
+             # --- 核心修復 1: 處理月份 (合併儲存格填補 + 格式統一) ---
              if '月份' in df_clean.columns:
                  df_clean['月份'] = df_clean['月份'].astype(str).str.strip()
                  df_clean['月份'] = df_clean['月份'].replace(['', 'nan', 'None'], np.nan)
@@ -88,14 +103,14 @@ def load_system_config():
                  df_clean['月份_dt'] = pd.to_datetime(df_clean['月份'], errors='coerce')
                  df_clean['月份_std'] = df_clean['月份_dt'].dt.strftime('%Y-%m')
 
-             # --- 關鍵修復 2: 處理分店 (合併儲存格填補 + 去空白) ---
+             # --- 核心修復 2: 處理分店 (合併儲存格填補 + 去空白) ---
              if '分店' in df_clean.columns:
                  df_clean['分店'] = df_clean['分店'].astype(str).str.strip()
                  df_clean['分店'] = df_clean['分店'].replace(['', 'nan', 'None'], np.nan)
                  df_clean['分店'] = df_clean['分店'].fillna(method='ffill') # 向下填補
                  df_clean['分店'] = df_clean['分店'].astype(str).str.strip() # 再次確保去空白
 
-             # --- 關鍵修復 3: 處理人員 (去空白) ---
+             # --- 核心修復 3: 處理人員 (去空白) ---
              if '人員' in df_clean.columns:
                  df_clean['人員'] = df_clean['人員'].astype(str).str.strip()
              
@@ -413,7 +428,7 @@ with c2:
 st.markdown("---")
 
 # =========================================================
-#  🏆 業績英雄榜 (正式版)
+#  🏆 業績英雄榜 (v7.1 正式版)
 # =========================================================
 if selected_branch == "ALL":
     lb_title = f"🏆 全公司業績英雄榜 ({selected_month})"
@@ -435,10 +450,14 @@ with st.expander("展開查看詳細排名", expanded=True):
     if df_rank_source.empty:
         st.info(f"⚠️ 尚無排名資料。")
     else:
+        # [v7.1 修改] 
+        # 1. 移除 'priority' 清單，直接使用原始欄位順序
+        # 2. 移除後台欄位的工作已經在 load_system_config 完成
+        
         fixed_cols = ['月份', '分店', '人員', '更新時間', 'Display', '月份_dt', '月份_str', '月份_std']
-        available_metrics = [c for c in df_rank_source.columns if c not in fixed_cols]
-        priority = ["毛利", "門號", "保險營收", "配件營收"]
-        sorted_metrics = sorted(available_metrics, key=lambda x: (priority.index(x) if x in priority else 999))
+        
+        # 依據原始 DataFrame 的欄位順序來產生列表，不再強制排序
+        sorted_metrics = [c for c in df_rank_source.columns if c not in fixed_cols]
         
         if not sorted_metrics:
             st.warning("找不到任何指標欄位")
@@ -509,6 +528,7 @@ with st.expander("展開查看詳細排名", expanded=True):
                     fig_rank_p.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
                     st.plotly_chart(fig_rank_p, use_container_width=True)
 
+        # 這裡的 caption 因為 "更新時間" 可能在切除線之後，所以可能不會顯示，這符合您的「去除後台雜訊」需求
         if '更新時間' in df_rank_source.columns:
             st.caption(f"ℹ️ 數據最後同步時間：{df_rank_source['更新時間'].iloc[0]}")
 
