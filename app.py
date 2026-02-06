@@ -5,7 +5,7 @@ import plotly.express as px
 import numpy as np
 from datetime import datetime
 
-# --- 1. 頁面基礎設定 (v7.1 正式版) ---
+# --- 1. 頁面基礎設定 (v7.2) ---
 st.set_page_config(page_title="馬尼通訊戰情室", page_icon="📱", layout="wide", initial_sidebar_state="expanded")
 
 # --- 2. 安全登入機制 ---
@@ -51,7 +51,7 @@ def clean_google_sheet_url(url):
     if "/edit" in url: url = url.split("/edit")[0] + "/edit"
     return url
 
-# --- 3. 讀取中央系統配置表 (v7.1 核心邏輯：填補 + 斷尾 + 原序) ---
+# --- 3. 讀取中央系統配置表 (v7.2 核心邏輯：填補 + 斷尾 + 原序 + 來客數修復) ---
 @st.cache_data(ttl=600)
 def load_system_config():
     if "leaderboard" not in st.secrets:
@@ -76,8 +76,7 @@ def load_system_config():
         df_clean = df_leaderboard_raw.copy()
         
         if not df_clean.empty:
-             # --- [v7.1 新增] 自動切除後台欄位 ---
-             # 邏輯：找到 "--->勿動" 這一欄，把它和後面的所有欄位都丟掉
+             # --- 自動切除後台欄位 (切刀) ---
              cols_list = list(df_clean.columns)
              cut_off_index = -1
              for i, col_name in enumerate(cols_list):
@@ -86,7 +85,6 @@ def load_system_config():
                      break
              
              if cut_off_index != -1:
-                 # 只保留 "--->勿動" 之前的欄位
                  df_clean = df_clean.iloc[:, :cut_off_index]
              
              # ------------------------------------
@@ -94,31 +92,44 @@ def load_system_config():
              # 確保欄位名稱為字串
              cols = [str(c) for c in df_clean.columns]
              
-             # --- 核心修復 1: 處理月份 (合併儲存格填補 + 格式統一) ---
+             # --- 修復 1: 處理月份 ---
              if '月份' in df_clean.columns:
                  df_clean['月份'] = df_clean['月份'].astype(str).str.strip()
                  df_clean['月份'] = df_clean['月份'].replace(['', 'nan', 'None'], np.nan)
-                 df_clean['月份'] = df_clean['月份'].fillna(method='ffill') # 向下填補
-                 
+                 df_clean['月份'] = df_clean['月份'].fillna(method='ffill') 
                  df_clean['月份_dt'] = pd.to_datetime(df_clean['月份'], errors='coerce')
                  df_clean['月份_std'] = df_clean['月份_dt'].dt.strftime('%Y-%m')
 
-             # --- 核心修復 2: 處理分店 (合併儲存格填補 + 去空白) ---
+             # --- 修復 2: 處理分店 ---
              if '分店' in df_clean.columns:
                  df_clean['分店'] = df_clean['分店'].astype(str).str.strip()
                  df_clean['分店'] = df_clean['分店'].replace(['', 'nan', 'None'], np.nan)
-                 df_clean['分店'] = df_clean['分店'].fillna(method='ffill') # 向下填補
-                 df_clean['分店'] = df_clean['分店'].astype(str).str.strip() # 再次確保去空白
+                 df_clean['分店'] = df_clean['分店'].fillna(method='ffill') 
+                 df_clean['分店'] = df_clean['分店'].astype(str).str.strip()
 
-             # --- 核心修復 3: 處理人員 (去空白) ---
+             # --- 修復 3: 處理人員 ---
              if '人員' in df_clean.columns:
                  df_clean['人員'] = df_clean['人員'].astype(str).str.strip()
+
+             # --- [v7.2 新增] 修復 4: 處理「來客數」日期格式錯誤 ---
+             if '來客數' in df_clean.columns:
+                 # 檢查是否被讀取為日期格式 (例如 1900-01-12)
+                 if pd.api.types.is_datetime64_any_dtype(df_clean['來客數']):
+                     # Excel/Sheets 的日期起算點約為 1899-12-30
+                     # 計算該日期距離 1899-12-30 幾天，就會還原成原本的數字
+                     base_date = pd.Timestamp("1899-12-30")
+                     df_clean['來客數'] = (df_clean['來客數'] - base_date).dt.days
+                 
+                 # 強制轉為數值 (如果不是日期而是字串，也會嘗試轉)
+                 df_clean['來客數'] = pd.to_numeric(df_clean['來客數'], errors='coerce').fillna(0).astype(int)
+
+             # ------------------------------------
              
-             # 排除關鍵字 (包含小西門等總表行)
+             # 排除關鍵字
              exclude_keywords = ["總表", "ALL", "Total", "小計", "合計", "小西門"] 
              mask_keyword = ~df_clean['人員'].isin(exclude_keywords)
              
-             # 智慧排除 (人員名 == 分店名)
+             # 智慧排除
              def is_not_store_summary(row):
                  branch = str(row['分店']).replace('店', '') 
                  person = str(row['人員'])
@@ -174,7 +185,6 @@ with st.sidebar:
     st.markdown("---")
     st.header("🏢 請選擇分店")
     
-    # 使用標準化後的月份進行過濾
     mask_month = df_sys_config['月份_std'] == selected_month
     current_month_config = df_sys_config[mask_month]
     
@@ -195,7 +205,6 @@ with st.sidebar:
         if not target_row.empty:
             raw_url = target_row.iloc[0]['試算表網址']
             target_url = clean_google_sheet_url(raw_url)
-            # 顯示連線資訊
             if selected_branch != "ALL":
                 st.caption(f"🔗 連線中: {selected_branch}")
         else:
@@ -246,12 +255,10 @@ def load_data(url, worksheet, selected_branch_name):
     
     try_list = []
     
-    # 如果是全店總表模式，才需要猜分頁名
     if worksheet == selected_branch_name or worksheet in ["ALL", "總表", "全店總表"]:
         if forced_name: try_list.append(forced_name)
         try_list.extend([worksheet, worksheet.replace("店", ""), "總表", "ALL"])
     else:
-        # 如果是選特定人，就只找那個人
         try_list = [worksheet] 
         
     df_raw = pd.DataFrame()
@@ -265,7 +272,6 @@ def load_data(url, worksheet, selected_branch_name):
             last_error = e
             continue 
             
-    # 嘗試讀取預設第一頁 (作為最後手段)
     if df_raw.empty and (worksheet == selected_branch_name or worksheet in ["ALL", "總表", "全店總表"]):
         try:
             df_raw = conn.read(spreadsheet=clean_url, header=None)
@@ -428,7 +434,7 @@ with c2:
 st.markdown("---")
 
 # =========================================================
-#  🏆 業績英雄榜 (v7.1 正式版)
+#  🏆 業績英雄榜 (v7.2 依原始順序排序)
 # =========================================================
 if selected_branch == "ALL":
     lb_title = f"🏆 全公司業績英雄榜 ({selected_month})"
@@ -450,13 +456,10 @@ with st.expander("展開查看詳細排名", expanded=True):
     if df_rank_source.empty:
         st.info(f"⚠️ 尚無排名資料。")
     else:
-        # [v7.1 修改] 
-        # 1. 移除 'priority' 清單，直接使用原始欄位順序
-        # 2. 移除後台欄位的工作已經在 load_system_config 完成
-        
+        # 定義固定不顯示的欄位
         fixed_cols = ['月份', '分店', '人員', '更新時間', 'Display', '月份_dt', '月份_str', '月份_std']
         
-        # 依據原始 DataFrame 的欄位順序來產生列表，不再強制排序
+        # 依據原始 DataFrame 的欄位順序來產生列表
         sorted_metrics = [c for c in df_rank_source.columns if c not in fixed_cols]
         
         if not sorted_metrics:
@@ -528,7 +531,6 @@ with st.expander("展開查看詳細排名", expanded=True):
                     fig_rank_p.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
                     st.plotly_chart(fig_rank_p, use_container_width=True)
 
-        # 這裡的 caption 因為 "更新時間" 可能在切除線之後，所以可能不會顯示，這符合您的「去除後台雜訊」需求
         if '更新時間' in df_rank_source.columns:
             st.caption(f"ℹ️ 數據最後同步時間：{df_rank_source['更新時間'].iloc[0]}")
 
